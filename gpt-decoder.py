@@ -11,7 +11,7 @@ learning_rate = 1e-3  # The learning rate.
 n_embed = 64  # The number of embedding dimensions.
 n_head = 4 # The number of communication channels
 n_layer = 4 # The number of attention heads.
-dropout_rate = 0.2 # The drop out rate.
+dropout_rate = 0.0 # The drop out rate.
 device = 'cpu' # The device to run the training on.
 
 # if torch.cuda.is_available():
@@ -95,7 +95,7 @@ def estimate_loss():
 
 class Head(nn.Module):
     '''
-    A single self attention head.
+    A single causal self attention head.
     '''
 
     def __init__(self, head_size: int, n_embed: int, block_size: int, dropout_rate: int):
@@ -112,28 +112,28 @@ class Head(nn.Module):
         self.dropout = nn.Dropout(p=dropout_rate)
 
     def forward(self, x: torch.Tensor):
-        B, T, C = x.shape
+        _, T, C = x.shape # batch size, sequence length, embedding dimensionality (n_embd).
         # Create the key and query in the (B, T) arrangement for each token.
-        k: torch.Tensor = self.key(x)  # (B, T, 16)
-        q: torch.Tensor = self.query(x)  # (B, T, 16)
+        k: torch.Tensor = self.key(x)  # (B, T, head_size)
+        q: torch.Tensor = self.query(x)  # (B, T, head_size)
         # Here each batch will have different weights because there are different tokens.
         # Each token in wei, knows it's position and what it has (key) and is looking for (query).
         # Each channel in C knows what it is (I am a constantent, I am a letter, .etc) which means that specific key
         # in that channel will have a key that will have a higher number. When a query is dot prod with that key it will
         # create a high affinity.
-        # (B, T, 16) @ (B, 16, T) => (B, T, T)
+        # (B, T, head_size) @ (B, head_size, T) => (B, T, T)
         wei: torch.Tensor = q @ k.transpose(-2, -1) * C**-0.5
         # Here we are scaling the attention so that the q, k, and wei will be unit variance.
         # Here we are not allowing all tokens to talk to each other. An encoder block will not have this line.
         wei = wei.masked_fill(
-            self.tril[:T, :T] == 0, float('-inf'))  # type: ignore
+            self.tril[:T, :T] == 0, float('-inf')) # (B, T, T)  # type: ignore
         # Softmaxing will create higher probs due to higher affinities above.
-        wei = F.softmax(input=wei, dim=-1)
+        wei = F.softmax(input=wei, dim=-1) # (B, T, T)
         # Add dropout layer.
         wei = self.dropout(wei)
         # Here x can be throught of as private info to this current token.
-        v = self.value(x)
-        out = wei @ v  # (B, T, T) @ (B, T, C) -> (B, T, C)
+        v: torch.Tensor = self.value(x) # (B, T, C).
+        out = wei @ v # (B, T, T) @ (B, T, C) -> (B, T, C)
 
         return out
 
