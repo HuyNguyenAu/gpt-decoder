@@ -5,7 +5,7 @@ from torch.nn import functional as F
 # Hyperparams.
 batch_size = 16  # The number of independent sequences to process in parallel.
 block_size = 32  # The length of a sequence or the context size.
-epochs = 500  # The number of epochs to train for.
+epochs = 5000  # The number of epochs to train for.
 eval_every_epochs = 200  # The epoch interval to print losses.
 learning_rate = 1e-3  # The learning rate.
 n_embed = 64  # The number of embedding dimensions.
@@ -14,10 +14,10 @@ n_layer = 4 # The number of attention heads.
 dropout_rate = 0.2 # The drop out rate.
 device = 'cpu' # The device to run the training on.
 
-if torch.cuda.is_available():
-    device = 'cuda'
-elif torch.backends.mps.is_available() and torch.backends.mps.is_built():
-    device = 'mps'
+# if torch.cuda.is_available():
+#     device = 'cuda'
+# elif torch.backends.mps.is_available() and torch.backends.mps.is_built():
+#     device = 'mps'
 
 # For reproducibility.
 torch.manual_seed(1337)
@@ -102,14 +102,14 @@ class Head(nn.Module):
         super().__init__()
 
         # What features I have that may be interesting to other tokens.
-        self.key = nn.Linear(n_embed, head_size, bias=False)
+        self.key = nn.Linear(in_features=n_embed, out_features=head_size, bias=False)
         # What features am I interested/looking for in other tokens.
-        self.query = nn.Linear(n_embed, head_size, bias=False)
+        self.query = nn.Linear(in_features=n_embed, out_features=head_size, bias=False)
         # What features am I interested/looking for in other tokens and that may be interesting to other tokens. It will also tell others that here's what I will communicate if you find me interesting.
-        self.value = nn.Linear(n_embed, head_size, bias=False)
+        self.value = nn.Linear(in_features=n_embed, out_features=head_size, bias=False)
         self.register_buffer('tril', torch.tril(
             torch.ones(block_size, block_size)))
-        self.dropout = nn.Dropout(dropout_rate)
+        self.dropout = nn.Dropout(p=dropout_rate)
 
     def forward(self, x: torch.Tensor):
         B, T, C = x.shape
@@ -128,7 +128,7 @@ class Head(nn.Module):
         wei = wei.masked_fill(
             self.tril[:T, :T] == 0, float('-inf'))  # type: ignore
         # Softmaxing will create higher probs due to higher affinities above.
-        wei = F.softmax(wei, dim=-1)
+        wei = F.softmax(input=wei, dim=-1)
         # Add dropout layer.
         wei = self.dropout(wei)
         # Here x can be throught of as private info to this current token.
@@ -146,9 +146,9 @@ class MultiHeadAttention(nn.Module):
     def __init__(self, n_heads: int, head_size: int, n_embed: int, block_size: int, dropout_rate: int):
         super().__init__()
 
-        self.heads = nn.ModuleList([Head(head_size, n_embed, block_size, dropout_rate) for _ in range(n_heads)])
-        self.proj = nn.Linear(n_embed, n_embed)
-        self.dropout = nn.Dropout(dropout_rate)
+        self.heads = nn.ModuleList([Head(head_size=head_size, n_embed=n_embed, block_size=block_size, dropout_rate=dropout_rate) for _ in range(n_heads)])
+        self.proj = nn.Linear(in_features=n_embed, out_features=n_embed)
+        self.dropout = nn.Dropout(p=dropout_rate)
 
     def forward(self, x: torch.Tensor):
         out = torch.cat([h(x) for h in self.heads], dim=-1)
@@ -162,10 +162,10 @@ class FeedForward(nn.Module):
         super().__init__()
 
         self.net = nn.Sequential(
-            nn.Linear(n_embed, 4 * n_embed),
+            nn.Linear(in_features=n_embed, out_features=4 * n_embed),
             nn.ReLU(),
-            nn.Linear(4 * n_embed, n_embed),
-            nn.Dropout(dropout_rate),
+            nn.Linear(in_features=4 * n_embed, out_features=n_embed),
+            nn.Dropout(p=dropout_rate),
         )
 
     def forward(self, x: torch.Tensor):
@@ -178,11 +178,11 @@ class Block(nn.Module):
 
         head_size = n_embed // n_heads
         # The self attention heads. Means the K, V, and Q are from the same source.
-        self.sa = MultiHeadAttention(n_heads, head_size, n_embed, block_size, dropout_rate)
+        self.sa = MultiHeadAttention(n_heads=n_heads, head_size=head_size, n_embed=n_embed, block_size=block_size, dropout_rate=dropout_rate)
         # A simple indirection layer.
-        self.ffwd = FeedForward(n_embed, dropout_rate)
-        self.ln1 = nn.LayerNorm(n_embed)
-        self.ln2 = nn.LayerNorm(n_embed)
+        self.ffwd = FeedForward(n_embed=n_embed, dropout_rate=dropout_rate)
+        self.ln1 = nn.LayerNorm(normalized_shape=n_embed)
+        self.ln2 = nn.LayerNorm(normalized_shape=n_embed)
 
     def forward(self, x: torch.Tensor):
         x = x + self.sa(self.ln1(x))
@@ -192,21 +192,21 @@ class Block(nn.Module):
 
 
 class GPTDecoder(nn.Module):
-    def __init__(self, n_embed: int, block_size: int, n_head: int, n_layer: int, dropout_rate: int):
+    def __init__(self, n_embed: int, block_size: int, n_heads: int, n_layer: int, dropout_rate: int):
         super().__init__()
 
         # Each token directly reads off the logits for the next token
         # from the lookup table.
-        self.token_embedding_table = nn.Embedding(vocab_size, n_embed)
+        self.token_embedding_table = nn.Embedding(num_embeddings=vocab_size, embedding_dim=n_embed)
         # Each position from 0 to block_size - 1 will have it's own embedding table.
-        self.position_embedding_table = nn.Embedding(block_size, n_embed)
+        self.position_embedding_table = nn.Embedding(num_embeddings=block_size, embedding_dim=n_embed)
         # 4 communication channels of 8-dimension self attention in parallel.
         self.blocks = nn.Sequential(
-            *[Block(n_head, n_embed, block_size, dropout_rate) for _ in range(n_layer)])
+            *[Block(n_heads=n_heads, n_embed=n_embed, block_size=block_size, dropout_rate=dropout_rate) for _ in range(n_layer)])
         # Final layer norm.
-        self.lnf = nn.LayerNorm(n_embed)
+        self.lnf = nn.LayerNorm(normalized_shape=n_embed)
         # Add a layer of indirection on top of the embedding table.
-        self.lm_head = nn.Linear(n_embed, vocab_size)
+        self.lm_head = nn.Linear(in_features=n_embed, out_features=vocab_size)
         self.block_size = block_size
 
     def forward(self, idx: torch.Tensor, targets: torch.Tensor = None):
@@ -229,7 +229,7 @@ class GPTDecoder(nn.Module):
             B, T, C = logits.shape
             logits = logits.view(B * T, C)
             targets = targets.view(B * T)
-            loss = F.cross_entropy(logits, targets)
+            loss = F.cross_entropy(input=logits, target=targets)
 
         return logits, loss
 
@@ -253,7 +253,7 @@ class GPTDecoder(nn.Module):
 
 
 # Move the model to the GPU.
-model = GPTDecoder(n_embed, block_size, n_head, n_layer, dropout_rate)
+model = GPTDecoder(n_embed=n_embed, block_size=block_size, n_heads=n_head, n_layer=n_layer, dropout_rate=dropout_rate)
 m = model.to(device)
 
 # Print the number of parameters in the model.
