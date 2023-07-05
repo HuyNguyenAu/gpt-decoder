@@ -10,10 +10,10 @@ steps = 5000  # The number of steps to train for.
 eval_every_steps = 200  # The epoch interval to print losses.
 learning_rate = 1e-3  # The learning rate.
 n_embed = 64  # The number of embedding dimensions.
-n_head = 4 # The number of communication channels
-n_layer = 4 # The number of attention heads.
-dropout_rate = 0.0 # The drop out rate.
-device = 'cpu' # The device to run the training on.
+n_head = 4  # The number of communication channels
+n_layer = 4  # The number of attention heads.
+dropout_rate = 0.0  # The drop out rate.
+device = 'cpu'  # The device to run the training on.
 
 # if torch.cuda.is_available():
 #     device = 'cuda'
@@ -103,22 +103,30 @@ class Head(nn.Module):
         super().__init__()
 
         # What features I have that may be interesting to other tokens.
-        self.key = nn.Linear(in_features=n_embed, out_features=head_size, bias=False)
+        self.key = nn.Linear(in_features=n_embed,
+                             out_features=head_size, bias=False)
         # What features am I interested/looking for in other tokens.
-        self.query = nn.Linear(in_features=n_embed, out_features=head_size, bias=False)
+        self.query = nn.Linear(in_features=n_embed,
+                               out_features=head_size, bias=False)
         # What features am I interested/looking for in other tokens and that may be interesting to other tokens. It will also tell others that here's what I will communicate if you find me interesting.
-        self.value = nn.Linear(in_features=n_embed, out_features=head_size, bias=False)
+        self.value = nn.Linear(in_features=n_embed,
+                               out_features=head_size, bias=False)
         self.register_buffer('tril', torch.tril(
             torch.ones(block_size, block_size)))
         self.dropout = nn.Dropout(p=dropout_rate)
-        
+
         # Apply Xavier uniform initialisation according to T-Fixup.
         nn.init.xavier_uniform_(self.key.weight, gain=1 / math.sqrt(2))
         nn.init.xavier_uniform_(self.query.weight, gain=1 / math.sqrt(2))
         nn.init.xavier_uniform_(self.value.weight, gain=1 / math.sqrt(2))
 
+        # Apply T-Fixup scaling.
+        self.value.weight = torch.nn.Parameter(
+            (9 * n_layer) ** (- 1 / 4) * self.value.weight)
+
     def forward(self, x: torch.Tensor):
-        _, T, C = x.shape # batch size, sequence length, embedding dimensionality (n_embd).
+        # batch size, sequence length, embedding dimensionality (n_embd).
+        _, T, C = x.shape
         # Create the key and query in the (B, T) arrangement for each token.
         k: torch.Tensor = self.key(x)  # (B, T, head_size)
         q: torch.Tensor = self.query(x)  # (B, T, head_size)
@@ -132,14 +140,14 @@ class Head(nn.Module):
         # Here we are scaling the attention so that the q, k, and wei will be unit variance.
         # Here we are not allowing all tokens to talk to each other. An encoder block will not have this line.
         wei = wei.masked_fill(
-            self.tril[:T, :T] == 0, float('-inf')) # (B, T, T)  # type: ignore
+            self.tril[:T, :T] == 0, float('-inf'))  # (B, T, T)  # type: ignore
         # Softmaxing will create higher probs due to higher affinities above.
-        wei = F.softmax(input=wei, dim=-1) # (B, T, T)
+        wei = F.softmax(input=wei, dim=-1)  # (B, T, T)
         # Add dropout layer.
         wei = self.dropout(wei)
         # Here x can be throught of as private info to this current token.
-        v: torch.Tensor = self.value(x) # (B, T, C).
-        out = wei @ v # (B, T, T) @ (B, T, C) -> (B, T, C)
+        v: torch.Tensor = self.value(x)  # (B, T, C).
+        out = wei @ v  # (B, T, T) @ (B, T, C) -> (B, T, C)
 
         return out
 
@@ -152,12 +160,17 @@ class MaskedMultiHeadAttention(nn.Module):
     def __init__(self, n_heads: int, head_size: int, n_embed: int, block_size: int, dropout_rate: int):
         super().__init__()
 
-        self.heads = nn.ModuleList([Head(head_size=head_size, n_embed=n_embed, block_size=block_size, dropout_rate=dropout_rate) for _ in range(n_heads)])
+        self.heads = nn.ModuleList([Head(head_size=head_size, n_embed=n_embed,
+                                   block_size=block_size, dropout_rate=dropout_rate) for _ in range(n_heads)])
         self.proj = nn.Linear(in_features=n_embed, out_features=n_embed)
         self.dropout = nn.Dropout(p=dropout_rate)
-        
+
         # Apply Xavier uniform initialisation according to T-Fixup.
         nn.init.xavier_uniform_(self.proj.weight, gain=1 / math.sqrt(2))
+
+        # Apply T-Fixup scaling.
+        self.proj.weight = torch.nn.Parameter(
+            (9 * n_layer) ** (- 1. / 4.) * self.proj.weight)
 
     def forward(self, x: torch.Tensor):
         out = torch.cat([h(x) for h in self.heads], dim=-1)
@@ -171,15 +184,21 @@ class FeedForward(nn.Module):
         super().__init__()
 
         self.net = nn.Sequential(
-            nn.Linear(in_features=n_embed, out_features=4 * n_embed),
+            nn.Linear(in_features=n_embed, out_features=4 * n_embed), # Apply Position-wise FFN multiplier.
             nn.ReLU(),
-            nn.Linear(in_features=4 * n_embed, out_features=n_embed),
+            nn.Linear(in_features=4 * n_embed, out_features=n_embed), # Apply Position-wise FFN multiplier.
             nn.Dropout(p=dropout_rate),
         )
-        
+
         # Apply Xavier uniform initialisation according to T-Fixup.
         nn.init.xavier_uniform_(self.net[0].weight, gain=1 / math.sqrt(2))
         nn.init.xavier_uniform_(self.net[-2].weight, gain=1 / math.sqrt(2))
+
+        # Apply T-Fixup scaling.
+        self.net[0].weight = torch.nn.Parameter(
+            (9 * n_layer) ** (- 1. / 4.) * self.net[0].weight)
+        self.net[-2].weight = torch.nn.Parameter(
+            (9 * n_layer) ** (- 1. / 4.) * self.net[-2].weight)
 
     def forward(self, x: torch.Tensor):
         return self.net(x)
@@ -191,13 +210,15 @@ class Block(nn.Module):
 
         head_size = n_embed // n_heads
         # The self attention heads. Means the K, V, and Q are from the same source.
-        self.sa = MaskedMultiHeadAttention(n_heads=n_heads, head_size=head_size, n_embed=n_embed, block_size=block_size, dropout_rate=dropout_rate)
+        self.sa = MaskedMultiHeadAttention(
+            n_heads=n_heads, head_size=head_size, n_embed=n_embed, block_size=block_size, dropout_rate=dropout_rate)
         # A simple indirection layer.
         self.ffwd = FeedForward(n_embed=n_embed, dropout_rate=dropout_rate)
         self.ln1 = nn.LayerNorm(normalized_shape=n_embed)
         self.ln2 = nn.LayerNorm(normalized_shape=n_embed)
 
     def forward(self, x: torch.Tensor):
+        # Apply pre-norm formulation where the layer norm is applied before each layer.
         x = x + self.sa(self.ln1(x))
         x = x + self.ffwd(self.ln2(x))
 
@@ -210,9 +231,11 @@ class GPTDecoder(nn.Module):
 
         # Each token directly reads off the logits for the next token
         # from the lookup table.
-        self.token_embedding_table = nn.Embedding(num_embeddings=vocab_size, embedding_dim=n_embed)
+        self.token_embedding_table = nn.Embedding(
+            num_embeddings=vocab_size, embedding_dim=n_embed)
         # Each position from 0 to block_size - 1 will have it's own embedding table.
-        self.position_embedding_table = nn.Embedding(num_embeddings=block_size, embedding_dim=n_embed)
+        self.position_embedding_table = nn.Embedding(
+            num_embeddings=block_size, embedding_dim=n_embed)
         # 4 communication channels of 8-dimension self attention in parallel.
         self.blocks = nn.Sequential(
             *[Block(n_heads=n_heads, n_embed=n_embed, block_size=block_size, dropout_rate=dropout_rate) for _ in range(n_layer)])
@@ -221,7 +244,7 @@ class GPTDecoder(nn.Module):
         # Add a layer of indirection on top of the embedding table.
         self.lm_head = nn.Linear(in_features=n_embed, out_features=vocab_size)
         self.block_size = block_size
-        
+
         # Apply Xavier uniform initialisation according to T-Fixup.
         nn.init.xavier_uniform_(self.lm_head.weight, gain=1 / math.sqrt(2))
 
@@ -269,7 +292,8 @@ class GPTDecoder(nn.Module):
 
 
 # Move the model to the GPU.
-model = GPTDecoder(n_embed=n_embed, block_size=block_size, n_heads=n_head, n_layer=n_layer, dropout_rate=dropout_rate)
+model = GPTDecoder(n_embed=n_embed, block_size=block_size,
+                   n_heads=n_head, n_layer=n_layer, dropout_rate=dropout_rate)
 m = model.to(device)
 
 # Print the number of parameters in the model.
