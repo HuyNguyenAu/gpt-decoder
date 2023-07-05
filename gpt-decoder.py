@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -5,8 +6,8 @@ from torch.nn import functional as F
 # Hyperparams.
 batch_size = 16  # The number of independent sequences to process in parallel.
 block_size = 32  # The length of a sequence or the context size.
-epochs = 5000  # The number of epochs to train for.
-eval_every_epochs = 200  # The epoch interval to print losses.
+steps = 5000  # The number of steps to train for.
+eval_every_steps = 200  # The epoch interval to print losses.
 learning_rate = 1e-3  # The learning rate.
 n_embed = 64  # The number of embedding dimensions.
 n_head = 4 # The number of communication channels
@@ -77,10 +78,10 @@ def estimate_loss():
     model.eval()
 
     for split in ['train', 'val']:
-        losses = torch.zeros(eval_every_epochs)
+        losses = torch.zeros(eval_every_steps)
 
-        # Get the average loss for every eval_every_epochs epochs.
-        for k in range(eval_every_epochs):
+        # Get the average loss for every eval_every_steps steps.
+        for k in range(eval_every_steps):
             X, Y = get_batch(split)
             _, loss = model(X, Y)
             losses[k] = loss.item()
@@ -110,6 +111,11 @@ class Head(nn.Module):
         self.register_buffer('tril', torch.tril(
             torch.ones(block_size, block_size)))
         self.dropout = nn.Dropout(p=dropout_rate)
+        
+        # Apply Xavier uniform initialisation according to T-Fixup.
+        nn.init.xavier_uniform_(self.key.weight, gain=1 / math.sqrt(2))
+        nn.init.xavier_uniform_(self.query.weight, gain=1 / math.sqrt(2))
+        nn.init.xavier_uniform_(self.value.weight, gain=1 / math.sqrt(2))
 
     def forward(self, x: torch.Tensor):
         _, T, C = x.shape # batch size, sequence length, embedding dimensionality (n_embd).
@@ -138,7 +144,7 @@ class Head(nn.Module):
         return out
 
 
-class MultiHeadAttention(nn.Module):
+class MaskedMultiHeadAttention(nn.Module):
     '''
     Multiple self attention heads in parallel.
     '''
@@ -149,6 +155,9 @@ class MultiHeadAttention(nn.Module):
         self.heads = nn.ModuleList([Head(head_size=head_size, n_embed=n_embed, block_size=block_size, dropout_rate=dropout_rate) for _ in range(n_heads)])
         self.proj = nn.Linear(in_features=n_embed, out_features=n_embed)
         self.dropout = nn.Dropout(p=dropout_rate)
+        
+        # Apply Xavier uniform initialisation according to T-Fixup.
+        nn.init.xavier_uniform_(self.proj.weight, gain=1 / math.sqrt(2))
 
     def forward(self, x: torch.Tensor):
         out = torch.cat([h(x) for h in self.heads], dim=-1)
@@ -167,6 +176,10 @@ class FeedForward(nn.Module):
             nn.Linear(in_features=4 * n_embed, out_features=n_embed),
             nn.Dropout(p=dropout_rate),
         )
+        
+        # Apply Xavier uniform initialisation according to T-Fixup.
+        nn.init.xavier_uniform_(self.net[0].weight, gain=1 / math.sqrt(2))
+        nn.init.xavier_uniform_(self.net[-2].weight, gain=1 / math.sqrt(2))
 
     def forward(self, x: torch.Tensor):
         return self.net(x)
@@ -178,7 +191,7 @@ class Block(nn.Module):
 
         head_size = n_embed // n_heads
         # The self attention heads. Means the K, V, and Q are from the same source.
-        self.sa = MultiHeadAttention(n_heads=n_heads, head_size=head_size, n_embed=n_embed, block_size=block_size, dropout_rate=dropout_rate)
+        self.sa = MaskedMultiHeadAttention(n_heads=n_heads, head_size=head_size, n_embed=n_embed, block_size=block_size, dropout_rate=dropout_rate)
         # A simple indirection layer.
         self.ffwd = FeedForward(n_embed=n_embed, dropout_rate=dropout_rate)
         self.ln1 = nn.LayerNorm(normalized_shape=n_embed)
@@ -208,6 +221,9 @@ class GPTDecoder(nn.Module):
         # Add a layer of indirection on top of the embedding table.
         self.lm_head = nn.Linear(in_features=n_embed, out_features=vocab_size)
         self.block_size = block_size
+        
+        # Apply Xavier uniform initialisation according to T-Fixup.
+        nn.init.xavier_uniform_(self.lm_head.weight, gain=1 / math.sqrt(2))
 
     def forward(self, idx: torch.Tensor, targets: torch.Tensor = None):
         B, T = idx.shape
@@ -259,13 +275,14 @@ m = model.to(device)
 # Print the number of parameters in the model.
 print(sum(p.numel() for p in m.parameters())/1e6, 'M parameters')
 
-# Set the optimiser
-optimiser = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+# Set the optimiser.
+# optimiser = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+optimiser = torch.optim.NAdam(model.parameters(), lr=learning_rate)
 
 # Train the model.
-for step in range(epochs):
+for step in range(steps):
     # Print out losses.
-    if step % eval_every_epochs == 0 or step == epochs - 1:
+    if step % eval_every_steps == 0 or step == steps - 1:
         losses = estimate_loss()
         print(
             f"Step: {step}, Train Loss: {losses['train']:.4f}, Val Loss: {losses['val']:.4f}")
