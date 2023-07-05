@@ -184,9 +184,9 @@ class FeedForward(nn.Module):
         super().__init__()
 
         self.net = nn.Sequential(
-            nn.Linear(in_features=n_embed, out_features=4 * n_embed),
+            nn.Linear(in_features=n_embed, out_features=4 * n_embed), # Apply Position-wise FFN multiplier.
             nn.ReLU(),
-            nn.Linear(in_features=4 * n_embed, out_features=n_embed),
+            nn.Linear(in_features=4 * n_embed, out_features=n_embed), # Apply Position-wise FFN multiplier.
             nn.Dropout(p=dropout_rate),
         )
 
@@ -218,6 +218,7 @@ class Block(nn.Module):
         self.ln2 = nn.LayerNorm(normalized_shape=n_embed)
 
     def forward(self, x: torch.Tensor):
+        # Apply pre-norm formulation where the layer norm is applied before each layer.
         x = x + self.sa(self.ln1(x))
         x = x + self.ffwd(self.ln2(x))
 
