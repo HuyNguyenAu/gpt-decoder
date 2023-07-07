@@ -179,14 +179,33 @@ class MaskedMultiHeadAttention(nn.Module):
         return out
 
 
+class SquaredReLU(nn.Module):
+    __constants__ = ['inplace']
+    inplace: bool
+
+    def __init__(self, inplace: bool = False):
+        super().__init__()
+        self.inplace = inplace
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        return torch.square(F.relu(input, inplace=self.inplace))
+
+    def extra_repr(self) -> str:
+        inplace_str = 'inplace=True' if self.inplace else ''
+        return inplace_str
+
+
 class FeedForward(nn.Module):
     def __init__(self, n_embed: int, dropout_rate: int) -> None:
         super().__init__()
 
         self.net = nn.Sequential(
-            nn.Linear(in_features=n_embed, out_features=4 * n_embed), # Apply Position-wise FFN multiplier.
-            nn.ReLU(),
-            nn.Linear(in_features=4 * n_embed, out_features=n_embed), # Apply Position-wise FFN multiplier.
+            # Apply Position-wise FFN multiplier.
+            nn.Linear(in_features=n_embed, out_features=4 * n_embed),
+            # From the paper 'Primer: Searching for Efficient Transformers for Language Modeling'.
+            SquaredReLU(),
+            # Apply Position-wise FFN multiplier.
+            nn.Linear(in_features=4 * n_embed, out_features=n_embed),
             nn.Dropout(p=dropout_rate),
         )
 
