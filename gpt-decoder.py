@@ -2,6 +2,9 @@ import math
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+from datetime import datetime
+from time import time
+import json
 
 # Hyperparams.
 batch_size = 16  # The number of independent sequences to process in parallel.
@@ -15,10 +18,10 @@ n_layer = 4  # The number of attention heads.
 dropout_rate = 0.0  # The drop out rate.
 device = 'cpu'  # The device to run the training on.
 
-# if torch.cuda.is_available():
-#     device = 'cuda'
-# elif torch.backends.mps.is_available() and torch.backends.mps.is_built():
-#     device = 'mps'
+if torch.cuda.is_available():
+    device = 'cuda'
+elif torch.backends.mps.is_available() and torch.backends.mps.is_built():
+    device = 'mps'
 
 # For reproducibility.
 torch.manual_seed(1337)
@@ -190,7 +193,7 @@ class MaskedMultiHeadAttention(nn.Module):
     Multiple self attention heads in parallel.
     '''
 
-    def __init__(self, n_heads: int, head_size: int, n_embed: int, block_size: int, dropout_rate: int):
+    def __init__(self, n_heads: int, head_size: int, n_embed: int, block_size: int, n_layer: int, dropout_rate: int):
         super().__init__()
 
         self.heads = nn.ModuleList([Head(head_size=head_size, n_embed=n_embed,
@@ -213,6 +216,10 @@ class MaskedMultiHeadAttention(nn.Module):
 
 
 class SquaredReLU(nn.Module):
+    '''
+    The squared ReLU.
+    '''
+
     def __init__(self):
         super().__init__()
 
@@ -221,7 +228,11 @@ class SquaredReLU(nn.Module):
 
 
 class FeedForward(nn.Module):
-    def __init__(self, n_embed: int, dropout_rate: int) -> None:
+    '''
+    A simple FFN.
+    '''
+
+    def __init__(self, n_embed: int, n_layer: int, dropout_rate: int) -> None:
         super().__init__()
 
         self.net = nn.Sequential(
@@ -249,15 +260,20 @@ class FeedForward(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, n_heads: int, n_embed: int, block_size: int, dropout_rate: int) -> None:
+    '''
+    The attention block.
+    '''
+    
+    def __init__(self, n_heads: int, n_embed: int, block_size: int, n_layer: int, dropout_rate: int) -> None:
         super().__init__()
 
         head_size = n_embed // n_heads
         # The self attention heads. Means the K, V, and Q are from the same source.
         self.sa = MaskedMultiHeadAttention(
-            n_heads=n_heads, head_size=head_size, n_embed=n_embed, block_size=block_size, dropout_rate=dropout_rate)
+            n_heads=n_heads, head_size=head_size, n_embed=n_embed, block_size=block_size, n_layer=n_layer, dropout_rate=dropout_rate)
         # A simple indirection layer.
-        self.ffwd = FeedForward(n_embed=n_embed, dropout_rate=dropout_rate)
+        self.ffwd = FeedForward(
+            n_embed=n_embed, n_layer=n_layer, dropout_rate=dropout_rate)
         self.ln1 = nn.LayerNorm(normalized_shape=n_embed)
         self.ln2 = nn.LayerNorm(normalized_shape=n_embed)
 
@@ -270,6 +286,10 @@ class Block(nn.Module):
 
 
 class GPTDecoder(nn.Module):
+    '''
+    The GPT decoder.
+    '''
+    
     def __init__(self, n_embed: int, block_size: int, n_heads: int, n_layer: int, dropout_rate: int):
         super().__init__()
 
@@ -282,7 +302,7 @@ class GPTDecoder(nn.Module):
             num_embeddings=block_size, embedding_dim=n_embed)
         # 4 communication channels of 8-dimension self attention in parallel.
         self.blocks = nn.Sequential(
-            *[Block(n_heads=n_heads, n_embed=n_embed, block_size=block_size, dropout_rate=dropout_rate) for _ in range(n_layer)])
+            *[Block(n_heads=n_heads, n_embed=n_embed, block_size=block_size, n_layer=n_layer, dropout_rate=dropout_rate) for _ in range(n_layer)])
         # Final layer norm.
         self.lnf = nn.LayerNorm(normalized_shape=n_embed)
         # Add a layer of indirection on top of the embedding table.
@@ -347,13 +367,28 @@ print(sum(p.numel() for p in m.parameters())/1e6, 'M parameters')
 # optimiser = torch.optim.AdamW(model.parameters(), lr=learning_rate)
 optimiser = torch.optim.NAdam(model.parameters(), lr=learning_rate)
 
+# Get the current datetime.
+current_date = datetime.now()
+
+# Keep track of the time elasped.
+start_time = time()
+
 # Train the model.
 for step in range(steps):
-    # Print out losses.
+    # Print out losses and store them in a file.
     if step % eval_every_steps == 0 or step == steps - 1:
         losses = estimate_loss()
-        print(
-            f"Step: {step}, Train Loss: {losses['train']:.4f}, Val Loss: {losses['val']:.4f}")
+        eval = {
+            'step': step,
+            'train_loss': round(losses['train'].item(), 4),
+            'val_loss': round(losses['val'].item(), 4),
+            'time_elapsed': round(time() - start_time, 4)
+        }
+        print(eval)
+
+        with open(f'{current_date.isoformat()}.json', 'a', encoding='utf-8') as file:
+            json.dump(eval, file)
+            file.write('\n')
 
     # Sample a batch of data.
     xb, yb = get_batch('train')
