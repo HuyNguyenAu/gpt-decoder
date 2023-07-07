@@ -94,6 +94,30 @@ def estimate_loss():
     return out
 
 
+class DepthwiseConvolution(nn.Module):
+    def __init__(self, head_size: int, kernel_size: int = 3) -> None:
+        super().__init__()
+
+        self.kernel_size = kernel_size
+        # We use PyTorch's `Conv1d` module.
+        # We set the number of groups to be equal to the number of channels so that it does a separate convolution
+        # (with different kernels) for each channel.
+        # We add padding to both sides and later crop the right most `kernel_size - 1` results
+        self.conv = nn.Conv1d(in_channels=head_size, out_channels=head_size,
+                              kernel_size=(kernel_size,), padding=(kernel_size - 1,), groups=head_size)
+
+    def forward(self, x: torch.Tensor):
+        x = x.permute(0, 2, 1)  # (B, head_size, T).
+        # 1D convolution accepts input of the form `[N, channels, sequence]`
+        # Conv1D expects (N, channels, sequence).
+        x = self.conv(x)
+        # Crop the right most kernel_size - 1 results since we padded both sides.
+        x = x[:, :, :-(self.kernel_size - 1)]
+        x = x.permute(0, 2, 1)  # (B, T, head_size)
+
+        return x
+
+
 class Head(nn.Module):
     '''
     A single causal self attention head.
@@ -103,26 +127,35 @@ class Head(nn.Module):
         super().__init__()
 
         # What features I have that may be interesting to other tokens.
-        self.key = nn.Linear(in_features=n_embed,
-                             out_features=head_size, bias=False)
+        self.key = nn.Sequential(
+            nn.Linear(in_features=n_embed, out_features=head_size, bias=False),
+            # TODO: Might remove since gains at smaller model size aren't worth it for the huge slow down.
+            DepthwiseConvolution(head_size=head_size)
+        )
         # What features am I interested/looking for in other tokens.
-        self.query = nn.Linear(in_features=n_embed,
-                               out_features=head_size, bias=False)
+        self.query = nn.Sequential(
+            nn.Linear(in_features=n_embed, out_features=head_size, bias=False),
+            # TODO: Might remove since gains at smaller model size aren't worth it for the huge slow down.
+            DepthwiseConvolution(head_size=head_size)
+        )
         # What features am I interested/looking for in other tokens and that may be interesting to other tokens. It will also tell others that here's what I will communicate if you find me interesting.
-        self.value = nn.Linear(in_features=n_embed,
-                               out_features=head_size, bias=False)
+        self.value = nn.Sequential(
+            nn.Linear(in_features=n_embed, out_features=head_size, bias=False),
+            # TODO: Might remove since gains at smaller model size aren't worth it for the huge slow down.
+            DepthwiseConvolution(head_size=head_size)
+        )
         self.register_buffer('tril', torch.tril(
             torch.ones(block_size, block_size)))
         self.dropout = nn.Dropout(p=dropout_rate)
 
         # Apply Xavier uniform initialisation according to T-Fixup.
-        nn.init.xavier_uniform_(self.key.weight, gain=1 / math.sqrt(2))
-        nn.init.xavier_uniform_(self.query.weight, gain=1 / math.sqrt(2))
-        nn.init.xavier_uniform_(self.value.weight, gain=1 / math.sqrt(2))
+        nn.init.xavier_uniform_(self.key[0].weight, gain=1 / math.sqrt(2))
+        nn.init.xavier_uniform_(self.query[0].weight, gain=1 / math.sqrt(2))
+        nn.init.xavier_uniform_(self.value[0].weight, gain=1 / math.sqrt(2))
 
         # Apply T-Fixup scaling.
-        self.value.weight = torch.nn.Parameter(
-            (9 * n_layer) ** (- 1 / 4) * self.value.weight)
+        self.value[0].weight = torch.nn.Parameter(
+            (9 * n_layer) ** (- 1 / 4) * self.value[0].weight)
 
     def forward(self, x: torch.Tensor):
         # batch size, sequence length, embedding dimensionality (n_embd).
@@ -180,19 +213,11 @@ class MaskedMultiHeadAttention(nn.Module):
 
 
 class SquaredReLU(nn.Module):
-    __constants__ = ['inplace']
-    inplace: bool
-
-    def __init__(self, inplace: bool = False):
+    def __init__(self):
         super().__init__()
-        self.inplace = inplace
 
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
-        return torch.square(F.relu(input, inplace=self.inplace))
-
-    def extra_repr(self) -> str:
-        inplace_str = 'inplace=True' if self.inplace else ''
-        return inplace_str
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.square(F.relu(x))
 
 
 class FeedForward(nn.Module):
