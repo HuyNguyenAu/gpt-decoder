@@ -56,6 +56,40 @@ val_data = data[dataset_length:]
 
 
 def get_batch(split):
+    '''
+    Get the inputs and targets as a rolling window up to the context size.
+    Inputs:
+        torch.Size([4, 8])
+        tensor([[24, 43, 58,  5, 57,  1, 46, 43],
+                [44, 53, 56,  1, 58, 46, 39, 58],
+                [52, 58,  1, 58, 46, 39, 58,  1],
+                [25, 17, 27, 10,  0, 21,  1, 54]])
+        Targets:
+        torch.Size([4, 8])
+        tensor([[43, 58,  5, 57,  1, 46, 43, 39],
+                [53, 56,  1, 58, 46, 39, 58,  1],
+                [58,  1, 58, 46, 39, 58,  1, 46],
+                [17, 27, 10,  0, 21,  1, 54, 39]])
+        ----
+        When input is [24] the target: 43
+        When input is [24, 43] the target: 58
+        When input is [24, 43, 58] the target: 5
+        When input is [24, 43, 58, 5] the target: 57
+        When input is [24, 43, 58, 5, 57] the target: 1
+        When input is [24, 43, 58, 5, 57, 1] the target: 46
+        When input is [24, 43, 58, 5, 57, 1, 46] the target: 43
+        When input is [24, 43, 58, 5, 57, 1, 46, 43] the target: 39
+        When input is [44] the target: 53
+        When input is [44, 53] the target: 56
+        When input is [44, 53, 56] the target: 1
+        When input is [44, 53, 56, 1] the target: 58
+        ...
+        When input is [25, 17, 27, 10, 0] the target: 21
+        When input is [25, 17, 27, 10, 0, 21] the target: 1
+        When input is [25, 17, 27, 10, 0, 21, 1] the target: 54
+        When input is [25, 17, 27, 10, 0, 21, 1, 54] the target: 39
+    '''
+
     data = train_data if split == 'train' else val_data
     # Generate a list of random numbers as the starting indexes
     # into the text.
@@ -64,7 +98,7 @@ def get_batch(split):
     # sequences which contain the characters from the starting index
     # and to starting index + context size.
     x = torch.stack([data[i:i + block_size] for i in ix])
-    # The targets are just the following character .
+    # The targets are just the following character.
     y = torch.stack([data[i+1:i + block_size + 1] for i in ix])
     # Copy to device.
     x, y = x.to(device), y.to(device)
@@ -74,6 +108,10 @@ def get_batch(split):
 
 @torch.no_grad()
 def estimate_loss():
+    '''
+    Estimate the training and validation loss..
+    '''
+
     out = {}
 
     # Set model in evaluation mode.
@@ -98,25 +136,28 @@ def estimate_loss():
 
 
 class DepthwiseConvolution(nn.Module):
+    '''
+    Perform a depthwise convolution.
+    '''
+
     def __init__(self, head_size: int, kernel_size: int = 3) -> None:
         super().__init__()
 
         self.kernel_size = kernel_size
         # We use PyTorch's `Conv1d` module.
-        # We set the number of groups to be equal to the number of channels so that it does a separate convolution
-        # (with different kernels) for each channel.
+        # We set the number of groups to be equal to the number of channels so that it does a separate convolution (with different kernels) for each channel.
         # We add padding to both sides and later crop the right most `kernel_size - 1` results
         self.conv = nn.Conv1d(in_channels=head_size, out_channels=head_size,
                               kernel_size=(kernel_size,), padding=(kernel_size - 1,), groups=head_size)
 
     def forward(self, x: torch.Tensor):
-        x = x.permute(0, 2, 1)  # (B, head_size, T).
-        # 1D convolution accepts input of the form `[N, channels, sequence]`
+        # (B, T, C) = (batch_size, block_size, n_embd) -> (B, n_embd, block_size).
+        x = x.permute(0, 2, 1)
         # Conv1D expects (N, channels, sequence).
         x = self.conv(x)
         # Crop the right most kernel_size - 1 results since we padded both sides.
         x = x[:, :, :-(self.kernel_size - 1)]
-        x = x.permute(0, 2, 1)  # (B, T, head_size)
+        x = x.permute(0, 2, 1)  # (B, T, C) = (batch_size, block_size, n_embd).
 
         return x
 
@@ -161,8 +202,7 @@ class Head(nn.Module):
             (9 * n_layer) ** (- 1 / 4) * self.value[0].weight)
 
     def forward(self, x: torch.Tensor):
-        # batch size, sequence length, embedding dimensionality (n_embd).
-        _, T, C = x.shape
+        _, T, C = x.shape  # (B, T, C) = (batch_size, block_size, n_embd).
         # Create the key and query in the (B, T) arrangement for each token.
         k: torch.Tensor = self.key(x)  # (B, T, head_size)
         q: torch.Tensor = self.query(x)  # (B, T, head_size)
@@ -171,19 +211,19 @@ class Head(nn.Module):
         # Each channel in C knows what it is (I am a constantent, I am a letter, .etc) which means that specific key
         # in that channel will have a key that will have a higher number. When a query is dot prod with that key it will
         # create a high affinity.
-        # (B, T, head_size) @ (B, head_size, T) => (B, T, T)
+        # (B, T, head_size) @ (B, head_size, T) => (B, T, T).
         wei: torch.Tensor = q @ k.transpose(-2, -1) * C**-0.5
         # Here we are scaling the attention so that the q, k, and wei will be unit variance.
         # Here we are not allowing all tokens to talk to each other. An encoder block will not have this line.
         wei = wei.masked_fill(
-            self.tril[:T, :T] == 0, float('-inf'))  # (B, T, T)  # type: ignore
+            self.tril[:T, :T] == 0, float('-inf'))  # (B, T, T).  # type: ignore
         # Softmaxing will create higher probs due to higher affinities above.
-        wei = F.softmax(input=wei, dim=-1)  # (B, T, T)
+        wei = F.softmax(input=wei, dim=-1)  # (B, T, T).
         # Add dropout layer.
-        wei = self.dropout(wei)
+        wei = self.dropout(wei)  # (B, T, T).
         # Here x can be throught of as private info to this current token.
         v: torch.Tensor = self.value(x)  # (B, T, C).
-        out = wei @ v  # (B, T, T) @ (B, T, C) -> (B, T, C)
+        out = wei @ v  # (B, T, T) @ (B, T, C) -> (B, T, C).
 
         return out
 
@@ -263,7 +303,7 @@ class Block(nn.Module):
     '''
     The attention block.
     '''
-    
+
     def __init__(self, n_heads: int, n_embed: int, block_size: int, n_layer: int, dropout_rate: int) -> None:
         super().__init__()
 
@@ -289,7 +329,7 @@ class GPTDecoder(nn.Module):
     '''
     The GPT decoder.
     '''
-    
+
     def __init__(self, n_embed: int, block_size: int, n_heads: int, n_layer: int, dropout_rate: int):
         super().__init__()
 
@@ -317,12 +357,14 @@ class GPTDecoder(nn.Module):
 
         # idx and targets are both (B, T) tensors of ints.
         # (B, T, C) = (Batch, Time, Channel) = (batch_size, block_size, vocab_size)
-        token_emb: torch.Tensor = self.token_embedding_table(idx)
+        token_emb: torch.Tensor = self.token_embedding_table(
+            idx)  # (B, T, n_embed)
         pos_emb = self.position_embedding_table(
-            torch.arange(T, device=device))  # (T, C)
-        x = token_emb + pos_emb  # (B, T, C)
-        x = self.blocks(x)  # Apply the heads of self attention (B, T, C).
-        x = self.lnf(x)  # (B,T,C)
+            torch.arange(T, device=device))  # (T, n_embed)
+        x = token_emb + pos_emb  # (B, T, n_embed)
+        # Apply the heads of self attention (B, T, n_embed).
+        x = self.blocks(x)
+        x = self.lnf(x)  # (B, T, n_embed)
         logits: torch.Tensor = self.lm_head(x)  # (B, T, vocab_size)
 
         if targets is None:
