@@ -1,5 +1,4 @@
 # GPT Decoder
-
 A simple GPT decoder for educational purposes following Andrej Karpathy's 'Let's build GPT: from scratch, in code, spelled out'.
 
 Here's an example output trained on some Shakespearean text:
@@ -117,11 +116,9 @@ In it shown'd fool thee such come a her be our are
 ## Optimisations
 
 ### Improving Transformer Optimization Through Better Initialization Paper
-
 - Added Xavier Uniform Init.
 - Added T-FixUp Init.
 
 ### Primer: Searching for Efficient Transformers for Language Modeling Paper
-
 - Added SquaredReLU.
 - Added Depthwise Convolution.
