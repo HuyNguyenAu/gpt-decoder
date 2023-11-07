@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -11,9 +12,9 @@ block_size = 32  # The length of a sequence or the context size.
 steps = 5000  # The number of steps to train for.
 eval_every_steps = 200  # The epoch interval to print losses.
 learning_rate = 1e-3  # The learning rate.
-n_layers = 6  # The number of communication channels
-n_embed = 384  # The number of embedding dimensions.
-n_head = 4  # The number of attention heads.
+n_embed = 64  # The number of embedding dimensions.
+n_heads = 4  # The number of communication channels
+n_layers = 4  # The number of attention heads.
 dropout_rate = 0.0  # The drop out rate.
 device = 'cpu'  # The device to run the training on.
 
@@ -139,12 +140,12 @@ class MaskedMultiHeadAttention(nn.Module):
     Multiple self attention heads in parallel.
     '''
 
-    def __init__(self, n_head: int, n_embed: int, dropout_rate: float):
+    def __init__(self, n_heads: int, n_embed: int, dropout_rate: float):
         super().__init__()
 
-        assert n_embed % n_head == 0, f'Embedding dimension {n_embed} should be divisible by the number of heads {n_head}.'
+        assert n_embed % n_heads == 0, f'Embedding dimension {n_embed} should be divisible by the number of heads {n_heads}.'
 
-        self.n_head = n_head
+        self.n_heads = n_heads
         self.n_embed = n_embed
         self.dropout_rate = dropout_rate
 
@@ -160,29 +161,38 @@ class MaskedMultiHeadAttention(nn.Module):
         self.attention_dropout = nn.Dropout(p=dropout_rate)
         self.residual_dropout = nn.Dropout(p=dropout_rate)
 
+        # Apply Xavier uniform initialisation according to T-Fixup.
+        nn.init.xavier_uniform_(self.attention.weight, gain=1 / math.sqrt(2))
+
+        nn.init.xavier_uniform_(self.proj.weight, gain=1 / math.sqrt(2))
+        torch.nn.init.zeros_(self.proj.bias)
+
     def forward(self, x: torch.Tensor):
         B, T, C = x.shape  # (B, T, C) = (batch_size, block_size, n_embed).
 
         # Since the output of attention is (B, T, C * 3), we split it into 3 equal parts of (B, T, C).
-        q, k, v = self.attention(x).split(self.n_embed, dim=2) 
-        
+        q, k, v = self.attention(x).split(self.n_embed, dim=2)
+
         # Since the scaled dot product attention expects the input to be (B, ..., T, C), we need to reshape the output of the attention.
         # This attention has the K, Q, V with the heads embedded in the channel dimension.
         # The data is of (B, T, C) shape and we want to squeeze the channel dimension into heads and head channels.
-        # That is C === self.n_head * (C // self.n_head).
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, n_head, T, block_size)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, n_head, T, block_size)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, n_head, T, block_size)
+        # That is C === self.n_heads * (C // self.n_heads).
+        # (B, n_heads, T, block_size)
+        k = k.view(B, T, self.n_heads, C // self.n_heads).transpose(1, 2)
+        # (B, n_heads, T, block_size)
+        q = q.view(B, T, self.n_heads, C // self.n_heads).transpose(1, 2)
+        # (B, n_heads, T, block_size)
+        v = v.view(B, T, self.n_heads, C // self.n_heads).transpose(1, 2)
 
-        # The Pytorch implementation of the scaled dot product attention returns (B, n_head, block_size, block_size).
-        # Q: (B, n_head, T, block_size) x K: (B, n_head, block_size, T) -> (B, n_head, T, T).
+        # The Pytorch implementation of the scaled dot product attention returns (B, n_heads, block_size, block_size).
+        # Q: (B, n_heads, T, block_size) x K: (B, n_heads, block_size, T) -> (B, n_heads, T, T).
         y = F.scaled_dot_product_attention(
             q, k, v, attn_mask=None, dropout_p=self.dropout_rate, is_causal=True)
         # Stretch the output back into (B, T, C).
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         # Apply projection.
         y = self.residual_dropout(self.proj(y))
-        
+
         return y
 
 
@@ -215,6 +225,10 @@ class FeedForward(nn.Module):
             nn.Dropout(p=dropout_rate),
         )
 
+        # Apply Xavier uniform initialisation according to T-Fixup.
+        nn.init.xavier_uniform_(self.net[0].weight, gain=1 / math.sqrt(2))
+        nn.init.xavier_uniform_(self.net[2].weight, gain=1 / math.sqrt(2))
+
     def forward(self, x: torch.Tensor):
         return self.net(x)
 
@@ -224,12 +238,12 @@ class Block(nn.Module):
     The attention block.
     '''
 
-    def __init__(self, n_head: int, n_embed: int, dropout_rate: float) -> None:
+    def __init__(self, n_heads: int, n_embed: int, dropout_rate: float) -> None:
         super().__init__()
 
         # The self attention heads. Means the K, V, and Q are from the same source.
         self.sa = MaskedMultiHeadAttention(
-            n_head=n_head, n_embed=n_embed, dropout_rate=dropout_rate)
+            n_heads=n_heads, n_embed=n_embed, dropout_rate=dropout_rate)
         # A simple indirection layer.
         self.ffwd = FeedForward(
             n_embed=n_embed, dropout_rate=dropout_rate)
@@ -249,7 +263,7 @@ class GPTDecoder(nn.Module):
     The GPT decoder.
     '''
 
-    def __init__(self, n_head:int, n_embed: int, n_layer: int, dropout_rate: float, vocab_size: int, block_size: int):
+    def __init__(self, n_heads: int, n_embed: int, n_layer: int, dropout_rate: float, vocab_size: int, block_size: int):
         super().__init__()
 
         # Each token directly reads off the logits for the next token
@@ -261,17 +275,31 @@ class GPTDecoder(nn.Module):
             num_embeddings=block_size, embedding_dim=n_embed)
         # 4 communication channels of 8-dimension self attention in parallel.
         self.blocks = nn.Sequential(
-            *[Block(n_head=n_head, n_embed=n_embed, dropout_rate=dropout_rate) for _ in range(n_layer)])
+            *[Block(n_heads=n_heads, n_embed=n_embed, dropout_rate=dropout_rate) for _ in range(n_layer)])
         # Final layer norm.
         self.lnf = nn.LayerNorm(normalized_shape=n_embed)
         # Add a layer of indirection on top of the embedding table.
         self.lm_head = nn.Linear(in_features=n_embed, out_features=vocab_size)
         self.block_size = block_size
 
+        # Initialise the weights.
+        # Apply Xavier uniform initialisation according to T-Fixup.
+        nn.init.xavier_uniform_(
+            self.token_embedding_table.weight, gain=n_embed / math.sqrt(2))
+        nn.init.xavier_uniform_(
+            self.position_embedding_table.weight, gain=n_embed / math.sqrt(2))
+        nn.init.xavier_uniform_(self.lm_head.weight, gain=1 / math.sqrt(2))
+
+        # Apply T-Fixup scaling.
+        self.token_embedding_table.weight = nn.Parameter(
+            (9 * n_layers) ** (- 1. / 4.) * self.token_embedding_table.weight)
+        self.position_embedding_table.weight = nn.Parameter(
+            (9 * n_layers) ** (- 1. / 4.) * self.position_embedding_table.weight)
+
     def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
         device = idx.device
         B, T = idx.shape
-        
+
         assert T <= self.block_size, f'The number of tokens {T} should be less than or equal to the block size {self.block_size}.'
 
         # idx and targets are both (B, T) tensors of ints.
@@ -317,7 +345,8 @@ class GPTDecoder(nn.Module):
 
 
 # Move the model to the GPU.
-model = GPTDecoder(n_head=n_head, n_embed=n_embed, n_layer=n_layers, dropout_rate=dropout_rate, vocab_size=vocab_size, block_size=block_size)
+model = GPTDecoder(n_heads=n_heads, n_embed=n_embed, n_layer=n_layers,
+                   dropout_rate=dropout_rate, vocab_size=vocab_size, block_size=block_size)
 m = model.to(device)
 
 # Print the number of parameters in the model.
