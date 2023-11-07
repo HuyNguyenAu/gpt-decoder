@@ -1,4 +1,3 @@
-import math
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -12,9 +11,9 @@ block_size = 32  # The length of a sequence or the context size.
 steps = 5000  # The number of steps to train for.
 eval_every_steps = 200  # The epoch interval to print losses.
 learning_rate = 1e-3  # The learning rate.
-n_embed = 64  # The number of embedding dimensions.
-n_head = 4  # The number of communication channels
-n_layer = 4  # The number of attention heads.
+n_layers = 6  # The number of communication channels
+n_embed = 384  # The number of embedding dimensions.
+n_head = 4  # The number of attention heads.
 dropout_rate = 0.0  # The drop out rate.
 device = 'cpu'  # The device to run the training on.
 
@@ -135,136 +134,68 @@ def estimate_loss():
     return out
 
 
-class DepthwiseConvolution(nn.Module):
-    '''
-    Perform a depthwise convolution.
-    '''
-
-    def __init__(self, head_size: int, kernel_size: int = 3) -> None:
-        super().__init__()
-
-        self.kernel_size = kernel_size
-        # We use PyTorch's `Conv1d` module.
-        # We set the number of groups to be equal to the number of channels so that it does a separate convolution (with different kernels) for each channel.
-        # We add padding to both sides and later crop the right most `kernel_size - 1` results
-        self.conv = nn.Conv1d(in_channels=head_size, out_channels=head_size,
-                              kernel_size=(kernel_size,), padding=(kernel_size - 1,), groups=head_size)
-
-    def forward(self, x: torch.Tensor):
-        # (B, T, C) = (batch_size, block_size, n_embd) -> (B, n_embd, block_size).
-        x = x.permute(0, 2, 1)
-        # Conv1D expects (N, channels, sequence).
-        x = self.conv(x)
-        # Crop the right most kernel_size - 1 results since we padded both sides.
-        x = x[:, :, :-(self.kernel_size - 1)]
-        x = x.permute(0, 2, 1)  # (B, T, C) = (batch_size, block_size, n_embd).
-
-        return x
-
-
-class Head(nn.Module):
-    '''
-    A single causal self attention head.
-    '''
-
-    def __init__(self, head_size: int, n_embed: int, block_size: int, dropout_rate: int):
-        super().__init__()
-
-        # What features I have that may be interesting to other tokens.
-        self.key = nn.Sequential(
-            nn.Linear(in_features=n_embed, out_features=head_size, bias=False),
-            # TODO: Might remove since gains at smaller model size aren't worth it for the huge slow down.
-            DepthwiseConvolution(head_size=head_size)
-        )
-        # What features am I interested/looking for in other tokens.
-        self.query = nn.Sequential(
-            nn.Linear(in_features=n_embed, out_features=head_size, bias=False),
-            # TODO: Might remove since gains at smaller model size aren't worth it for the huge slow down.
-            DepthwiseConvolution(head_size=head_size)
-        )
-        # What features am I interested/looking for in other tokens and that may be interesting to other tokens. It will also tell others that here's what I will communicate if you find me interesting.
-        self.value = nn.Sequential(
-            nn.Linear(in_features=n_embed, out_features=head_size, bias=False),
-            # TODO: Might remove since gains at smaller model size aren't worth it for the huge slow down.
-            DepthwiseConvolution(head_size=head_size)
-        )
-        self.register_buffer('tril', torch.tril(
-            torch.ones(block_size, block_size)))
-        self.dropout = nn.Dropout(p=dropout_rate)
-
-        # Apply Xavier uniform initialisation according to T-Fixup.
-        nn.init.xavier_uniform_(self.key[0].weight, gain=1 / math.sqrt(2))
-        nn.init.xavier_uniform_(self.query[0].weight, gain=1 / math.sqrt(2))
-        nn.init.xavier_uniform_(self.value[0].weight, gain=1 / math.sqrt(2))
-
-        # Apply T-Fixup scaling.
-        self.value[0].weight = torch.nn.Parameter(
-            (9 * n_layer) ** (- 1 / 4) * self.value[0].weight)
-
-    def forward(self, x: torch.Tensor):
-        _, T, C = x.shape  # (B, T, C) = (batch_size, block_size, n_embd).
-        # Create the key and query in the (B, T) arrangement for each token.
-        k: torch.Tensor = self.key(x)  # (B, T, head_size)
-        q: torch.Tensor = self.query(x)  # (B, T, head_size)
-        # Here each batch will have different weights because there are different tokens.
-        # Each token in wei, knows it's position and what it has (key) and is looking for (query).
-        # Each channel in C knows what it is (I am a constantent, I am a letter, .etc) which means that specific key
-        # in that channel will have a key that will have a higher number. When a query is dot prod with that key it will
-        # create a high affinity.
-        # (B, T, head_size) @ (B, head_size, T) => (B, T, T).
-        wei: torch.Tensor = q @ k.transpose(-2, -1) * C**-0.5
-        # Here we are scaling the attention so that the q, k, and wei will be unit variance.
-        # Here we are not allowing all tokens to talk to each other. An encoder block will not have this line.
-        wei = wei.masked_fill(
-            self.tril[:T, :T] == 0, float('-inf'))  # (B, T, T).  # type: ignore
-        # Softmaxing will create higher probs due to higher affinities above.
-        wei = F.softmax(input=wei, dim=-1)  # (B, T, T).
-        # Add dropout layer.
-        wei = self.dropout(wei)  # (B, T, T).
-        # Here x can be throught of as private info to this current token.
-        v: torch.Tensor = self.value(x)  # (B, T, C).
-        out = wei @ v  # (B, T, T) @ (B, T, C) -> (B, T, C).
-
-        return out
-
-
 class MaskedMultiHeadAttention(nn.Module):
     '''
     Multiple self attention heads in parallel.
     '''
 
-    def __init__(self, n_heads: int, head_size: int, n_embed: int, block_size: int, n_layer: int, dropout_rate: int):
+    def __init__(self, n_head: int, n_embed: int, dropout_rate: float):
         super().__init__()
 
-        self.heads = nn.ModuleList([Head(head_size=head_size, n_embed=n_embed,
-                                   block_size=block_size, dropout_rate=dropout_rate) for _ in range(n_heads)])
+        assert n_embed % n_head == 0, f'Embedding dimension {n_embed} should be divisible by the number of heads {n_head}.'
+
+        self.n_head = n_head
+        self.n_embed = n_embed
+        self.dropout_rate = dropout_rate
+
+        # Key: What features I have that may be interesting to other tokens.
+        # Query: What features am I interested/looking for in other tokens.
+        # Value: What features am I interested/looking for in other tokens and that may be interesting to other tokens. It will also tell others that here's what I will communicate if you find me interesting.
+
+        # Key, query, value batched projections for all heads.
+        # Stack the K, Q, and V projections.
+        self.attention = nn.Linear(
+            in_features=n_embed, out_features=n_embed * 3, bias=False)
         self.proj = nn.Linear(in_features=n_embed, out_features=n_embed)
-        self.dropout = nn.Dropout(p=dropout_rate)
-
-        # Apply Xavier uniform initialisation according to T-Fixup.
-        nn.init.xavier_uniform_(self.proj.weight, gain=1 / math.sqrt(2))
-
-        # Apply T-Fixup scaling.
-        self.proj.weight = torch.nn.Parameter(
-            (9 * n_layer) ** (- 1. / 4.) * self.proj.weight)
+        self.attention_dropout = nn.Dropout(p=dropout_rate)
+        self.residual_dropout = nn.Dropout(p=dropout_rate)
 
     def forward(self, x: torch.Tensor):
-        out = torch.cat([h(x) for h in self.heads], dim=-1)
-        out = self.dropout(self.proj(out))
+        B, T, C = x.shape  # (B, T, C) = (batch_size, block_size, n_embed).
 
-        return out
+        # Since the output of attention is (B, T, C * 3), we split it into 3 equal parts of (B, T, C).
+        q, k, v = self.attention(x).split(self.n_embed, dim=2) 
+        
+        # Since the scaled dot product attention expects the input to be (B, ..., T, C), we need to reshape the output of the attention.
+        # This attention has the K, Q, V with the heads embedded in the channel dimension.
+        # The data is of (B, T, C) shape and we want to squeeze the channel dimension into heads and head channels.
+        # That is C === self.n_head * (C // self.n_head).
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, n_head, T, block_size)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, n_head, T, block_size)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, n_head, T, block_size)
+
+        # The Pytorch implementation of the scaled dot product attention returns (B, n_head, block_size, block_size).
+        # Q: (B, n_head, T, block_size) x K: (B, n_head, block_size, T) -> (B, n_head, T, T).
+        y = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=None, dropout_p=self.dropout_rate, is_causal=True)
+        # Stretch the output back into (B, T, C).
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        # Apply projection.
+        y = self.residual_dropout(self.proj(y))
+        
+        return y
 
 
-class SquaredReLU(nn.Module):
+class GeLU(nn.Module):
     '''
-    The squared ReLU.
+    The GeLU layer.
     '''
 
     def __init__(self):
         super().__init__()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.square(F.relu(x))
+        return F.gelu(x)
 
 
 class FeedForward(nn.Module):
@@ -272,28 +203,17 @@ class FeedForward(nn.Module):
     A simple FFN.
     '''
 
-    def __init__(self, n_embed: int, n_layer: int, dropout_rate: int) -> None:
+    def __init__(self, n_embed: int, dropout_rate: float) -> None:
         super().__init__()
 
         self.net = nn.Sequential(
             # Apply Position-wise FFN multiplier.
             nn.Linear(in_features=n_embed, out_features=4 * n_embed),
-            # From the paper 'Primer: Searching for Efficient Transformers for Language Modeling'.
-            SquaredReLU(),
+            GeLU(),
             # Apply Position-wise FFN multiplier.
             nn.Linear(in_features=4 * n_embed, out_features=n_embed),
             nn.Dropout(p=dropout_rate),
         )
-
-        # Apply Xavier uniform initialisation according to T-Fixup.
-        nn.init.xavier_uniform_(self.net[0].weight, gain=1 / math.sqrt(2))
-        nn.init.xavier_uniform_(self.net[-2].weight, gain=1 / math.sqrt(2))
-
-        # Apply T-Fixup scaling.
-        self.net[0].weight = torch.nn.Parameter(
-            (9 * n_layer) ** (- 1. / 4.) * self.net[0].weight)
-        self.net[-2].weight = torch.nn.Parameter(
-            (9 * n_layer) ** (- 1. / 4.) * self.net[-2].weight)
 
     def forward(self, x: torch.Tensor):
         return self.net(x)
@@ -304,16 +224,15 @@ class Block(nn.Module):
     The attention block.
     '''
 
-    def __init__(self, n_heads: int, n_embed: int, block_size: int, n_layer: int, dropout_rate: int) -> None:
+    def __init__(self, n_head: int, n_embed: int, dropout_rate: float) -> None:
         super().__init__()
 
-        head_size = n_embed // n_heads
         # The self attention heads. Means the K, V, and Q are from the same source.
         self.sa = MaskedMultiHeadAttention(
-            n_heads=n_heads, head_size=head_size, n_embed=n_embed, block_size=block_size, n_layer=n_layer, dropout_rate=dropout_rate)
+            n_head=n_head, n_embed=n_embed, dropout_rate=dropout_rate)
         # A simple indirection layer.
         self.ffwd = FeedForward(
-            n_embed=n_embed, n_layer=n_layer, dropout_rate=dropout_rate)
+            n_embed=n_embed, dropout_rate=dropout_rate)
         self.ln1 = nn.LayerNorm(normalized_shape=n_embed)
         self.ln2 = nn.LayerNorm(normalized_shape=n_embed)
 
@@ -330,7 +249,7 @@ class GPTDecoder(nn.Module):
     The GPT decoder.
     '''
 
-    def __init__(self, n_embed: int, block_size: int, n_heads: int, n_layer: int, dropout_rate: int):
+    def __init__(self, n_head:int, n_embed: int, n_layer: int, dropout_rate: float, vocab_size: int, block_size: int):
         super().__init__()
 
         # Each token directly reads off the logits for the next token
@@ -342,18 +261,18 @@ class GPTDecoder(nn.Module):
             num_embeddings=block_size, embedding_dim=n_embed)
         # 4 communication channels of 8-dimension self attention in parallel.
         self.blocks = nn.Sequential(
-            *[Block(n_heads=n_heads, n_embed=n_embed, block_size=block_size, n_layer=n_layer, dropout_rate=dropout_rate) for _ in range(n_layer)])
+            *[Block(n_head=n_head, n_embed=n_embed, dropout_rate=dropout_rate) for _ in range(n_layer)])
         # Final layer norm.
         self.lnf = nn.LayerNorm(normalized_shape=n_embed)
         # Add a layer of indirection on top of the embedding table.
         self.lm_head = nn.Linear(in_features=n_embed, out_features=vocab_size)
         self.block_size = block_size
 
-        # Apply Xavier uniform initialisation according to T-Fixup.
-        nn.init.xavier_uniform_(self.lm_head.weight, gain=1 / math.sqrt(2))
-
-    def forward(self, idx: torch.Tensor, targets: torch.Tensor = None):
+    def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
+        device = idx.device
         B, T = idx.shape
+        
+        assert T <= self.block_size, f'The number of tokens {T} should be less than or equal to the block size {self.block_size}.'
 
         # idx and targets are both (B, T) tensors of ints.
         # (B, T, C) = (Batch, Time, Channel) = (batch_size, block_size, vocab_size)
@@ -398,16 +317,15 @@ class GPTDecoder(nn.Module):
 
 
 # Move the model to the GPU.
-model = GPTDecoder(n_embed=n_embed, block_size=block_size,
-                   n_heads=n_head, n_layer=n_layer, dropout_rate=dropout_rate)
+model = GPTDecoder(n_head=n_head, n_embed=n_embed, n_layer=n_layers, dropout_rate=dropout_rate, vocab_size=vocab_size, block_size=block_size)
 m = model.to(device)
 
 # Print the number of parameters in the model.
 print(sum(p.numel() for p in m.parameters())/1e6, 'M parameters')
 
 # Set the optimiser.
-# optimiser = torch.optim.AdamW(model.parameters(), lr=learning_rate)
-optimiser = torch.optim.NAdam(model.parameters(), lr=learning_rate)
+optimiser = torch.optim.AdamW(model.parameters(), lr=learning_rate, fused=True)
+# optimiser = torch.optim.NAdam(model.parameters(), lr=learning_rate)
 
 # Get the current datetime.
 current_date = datetime.now()
