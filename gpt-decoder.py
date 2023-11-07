@@ -325,7 +325,6 @@ print(sum(p.numel() for p in m.parameters())/1e6, 'M parameters')
 
 # Set the optimiser.
 optimiser = torch.optim.AdamW(model.parameters(), lr=learning_rate, fused=True)
-# optimiser = torch.optim.NAdam(model.parameters(), lr=learning_rate)
 
 # Get the current datetime.
 current_date = datetime.now()
