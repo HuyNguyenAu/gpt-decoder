@@ -12,9 +12,9 @@ block_size = 32  # The length of a sequence or the context size.
 steps = 5000  # The number of steps to train for.
 eval_every_steps = 200  # The epoch interval to print losses.
 learning_rate = 1e-3  # The learning rate.
-n_embed = 64  # The number of embedding dimensions.
-n_heads = 4  # The number of communication channels
-n_layers = 4  # The number of attention heads.
+n_layers = 6 # The number of attention heads.
+n_embed = 512  # The number of embedding dimensions.
+n_heads = 8  # The number of communication channels
 dropout_rate = 0.0  # The drop out rate.
 device = 'cpu'  # The device to run the training on.
 
@@ -167,6 +167,16 @@ class MaskedMultiHeadAttention(nn.Module):
         nn.init.xavier_uniform_(self.proj.weight, gain=1 / math.sqrt(2))
         torch.nn.init.zeros_(self.proj.bias)
 
+        # Apply T-Fixup scaling.
+        self.proj.weight = torch.nn.Parameter(
+            (9 * n_layers) ** (- 1. / 4.) * self.proj.weight)
+        
+        q, k, v = self.attention.weight.split(self.n_embed, dim=0)
+        v = torch.nn.Parameter(
+            (9 * n_layers) ** (- 1. / 4.) * (v * (2**0.5)))
+        self.attention.weight = torch.nn.Parameter(torch.concat((q, k, v), dim=0))
+        
+
     def forward(self, x: torch.Tensor):
         B, T, C = x.shape  # (B, T, C) = (batch_size, block_size, n_embed).
 
@@ -227,7 +237,16 @@ class FeedForward(nn.Module):
 
         # Apply Xavier uniform initialisation according to T-Fixup.
         nn.init.xavier_uniform_(self.net[0].weight, gain=1 / math.sqrt(2))
+        torch.nn.init.zeros_(self.net[0].bias)
+
         nn.init.xavier_uniform_(self.net[2].weight, gain=1 / math.sqrt(2))
+        torch.nn.init.zeros_(self.net[2].bias)
+
+        # Apply T-Fixup scaling.
+        self.net[0].weight = torch.nn.Parameter(
+            (9 * n_layers) ** (- 1. / 4.) * self.net[0].weight)
+        self.net[2].weight = torch.nn.Parameter(
+            (9 * n_layers) ** (- 1. / 4.) * self.net[2].weight)
 
     def forward(self, x: torch.Tensor):
         return self.net(x)
@@ -263,7 +282,7 @@ class GPTDecoder(nn.Module):
     The GPT decoder.
     '''
 
-    def __init__(self, n_heads: int, n_embed: int, n_layer: int, dropout_rate: float, vocab_size: int, block_size: int):
+    def __init__(self, n_heads: int, n_embed: int, n_layers: int, dropout_rate: float, vocab_size: int, block_size: int):
         super().__init__()
 
         # Each token directly reads off the logits for the next token
@@ -275,7 +294,7 @@ class GPTDecoder(nn.Module):
             num_embeddings=block_size, embedding_dim=n_embed)
         # 4 communication channels of 8-dimension self attention in parallel.
         self.blocks = nn.Sequential(
-            *[Block(n_heads=n_heads, n_embed=n_embed, dropout_rate=dropout_rate) for _ in range(n_layer)])
+            *[Block(n_heads=n_heads, n_embed=n_embed, dropout_rate=dropout_rate) for _ in range(n_layers)])
         # Final layer norm.
         self.lnf = nn.LayerNorm(normalized_shape=n_embed)
         # Add a layer of indirection on top of the embedding table.
@@ -288,7 +307,9 @@ class GPTDecoder(nn.Module):
             self.token_embedding_table.weight, gain=n_embed / math.sqrt(2))
         nn.init.xavier_uniform_(
             self.position_embedding_table.weight, gain=n_embed / math.sqrt(2))
+
         nn.init.xavier_uniform_(self.lm_head.weight, gain=1 / math.sqrt(2))
+        torch.nn.init.zeros_(self.lm_head.bias)
 
         # Apply T-Fixup scaling.
         self.token_embedding_table.weight = nn.Parameter(
@@ -345,7 +366,7 @@ class GPTDecoder(nn.Module):
 
 
 # Move the model to the GPU.
-model = GPTDecoder(n_heads=n_heads, n_embed=n_embed, n_layer=n_layers,
+model = GPTDecoder(n_heads=n_heads, n_embed=n_embed, n_layers=n_layers,
                    dropout_rate=dropout_rate, vocab_size=vocab_size, block_size=block_size)
 m = model.to(device)
 
